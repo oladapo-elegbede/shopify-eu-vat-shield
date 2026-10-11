@@ -192,3 +192,80 @@ async def create_exempt_checkout(request: ExemptCheckoutRequest):
             error=str(exc),
             error_code="DRAFT_ORDER_FAILED"
         )
+
+        # =====================================================================
+# SHOPIFY RECURRING BILLING ENGINE ($39/mo + 7-DAY FREE TRIAL)
+# =====================================================================
+
+PLAN_NAME = "EU VAT Shield Unlimited B2B"
+PLAN_PRICE = 39.00  # $39.00 USD / month
+TRIAL_DAYS = 7     # 7 Days 100% Free Trial
+
+async def create_7day_trial_subscription(shop_domain: str) -> str:
+    """
+    Creates a Shopify Recurring Application Charge with a 7-Day Free Trial.
+    Returns the official Shopify confirmation URL for merchant approval.
+    """
+    graphql_url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+        "Content-Type": "application/json",
+    }
+
+    # Shopify GraphQL Mutation for App Subscriptions
+    mutation = """
+    mutation AppSubscriptionCreate($name: String!, $lineItems: [AppSubscriptionLineItemInput!]!, $returnUrl: URL!, $trialDays: Int!, $test: Boolean) {
+      appSubscriptionCreate(name: $name, lineItems: $lineItems, returnUrl: $returnUrl, trialDays: $trialDays, test: $test) {
+        userErrors { field message }
+        confirmationUrl
+      }
+    }
+    """
+
+    # Set test=True during development (no real charges), test=False for live sales
+    variables = {
+        "name": PLAN_NAME,
+        "returnUrl": f"https://{shop_domain}/admin/apps",
+        "trialDays": TRIAL_DAYS,
+        "test": True,  # Set to False when taking real money from merchants
+        "lineItems": [{
+            "plan": {
+                "appRecurringPricingDetails": {
+                    "price": {"amount": PLAN_PRICE, "currencyCode": "USD"},
+                    "interval": "EVERY_30_DAYS"
+                }
+            }
+        }]
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(graphql_url, headers=headers, json={"query": mutation, "variables": variables})
+        data = res.json()
+
+    result = data.get("data", {}).get("appSubscriptionCreate", {})
+    confirmation_url = result.get("confirmationUrl")
+
+    if not confirmation_url:
+        errors = result.get("userErrors", [])
+        logger.error("Subscription Creation Failed: %s", errors)
+        raise Exception(f"Subscription Error: {errors}")
+
+    return confirmation_url
+
+
+@app.get("/api/v1/billing/subscribe")
+async def start_billing_flow(shop: Optional[str] = None):
+    """
+    Merchant redirected here after installation to approve $39/mo subscription.
+    """
+    target_shop = shop or SHOPIFY_SHOP_DOMAIN
+    if not target_shop:
+        raise HTTPException(status_code=400, detail="Missing shop parameter")
+
+    try:
+        confirmation_url = await create_7day_trial_subscription(target_shop)
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=confirmation_url)
+    except Exception as exc:
+        logger.error("Billing error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
