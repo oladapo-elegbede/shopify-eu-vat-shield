@@ -1,6 +1,6 @@
 """
 FastAPI Server for EU VAT Shield
-Handles VAT Validation, 0% Tax Draft Checkout, OAuth Billing, and Merchant Admin Dashboard
+Handles VAT Validation, 0% Tax Draft Checkout, OAuth Partner Token Exchange, and Billing
 """
 
 import logging
@@ -102,6 +102,7 @@ async def exchange_code_for_token(shop: str, code: str) -> str:
         data = res.json()
     token = data.get("access_token")
     if not token:
+        logger.error("OAuth exchange failed: %s", data)
         raise Exception(f"OAuth Exchange Failed: {data}")
     return token
 
@@ -181,7 +182,7 @@ async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
         "name": PLAN_NAME,
         "returnUrl": f"https://{shop_domain}/admin/apps",
         "trialDays": TRIAL_DAYS,
-        "test": True,  # Set to False when live taking real payment
+        "test": True,  # Set to False when taking real money
         "lineItems": [{
             "plan": {
                 "appRecurringPricingDetails": {
@@ -209,23 +210,27 @@ async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
 
 # --- Routes ---
 
-# 🔴 MERCHANTS EMBEDDED DASHBOARD (Fixes the 404 "Not Found" inside Shopify Admin)
+# 🔴 MERCHANTS EMBEDDED DASHBOARD
 @app.get("/", response_class=HTMLResponse)
 async def merchant_admin_dashboard(shop: Optional[str] = None):
-    return """
+    target_shop = shop or SHOPIFY_SHOP_DOMAIN
+    billing_link = f"/api/v1/billing/subscribe?shop={target_shop}" if target_shop else "/api/v1/billing/subscribe"
+    
+    return f"""
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <title>EU VAT Shield Admin</title>
         <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f6f6f7; padding: 40px; color: #202223; }
-            .card { background: #ffffff; border-radius: 8px; border: 1px solid #e1e3e5; padding: 32px; max-width: 550px; margin: 20px auto; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-            .status-badge { display: inline-block; background: #e6f4ea; color: #007f5f; padding: 6px 12px; border-radius: 20px; font-weight: 600; font-size: 13px; margin-bottom: 16px; }
-            h1 { font-size: 20px; margin: 0 0 8px 0; }
-            p { font-size: 14px; line-height: 1.5; color: #5c5f62; margin-bottom: 20px; }
-            .instruction-box { background: #f4f6f8; border-left: 4px solid #008060; padding: 14px; border-radius: 4px; font-size: 13px; margin-top: 20px; }
-            .btn { display: inline-block; background: #008060; color: #ffffff; padding: 10px 18px; border-radius: 4px; text-decoration: none; font-weight: 600; font-size: 14px; margin-top: 10px; }
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f6f6f7; padding: 40px; color: #202223; }}
+            .card {{ background: #ffffff; border-radius: 8px; border: 1px solid #e1e3e5; padding: 32px; max-width: 550px; margin: 20px auto; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
+            .status-badge {{ display: inline-block; background: #e6f4ea; color: #007f5f; padding: 6px 12px; border-radius: 20px; font-weight: 600; font-size: 13px; margin-bottom: 16px; }}
+            h1 {{ font-size: 20px; margin: 0 0 8px 0; }}
+            p {{ font-size: 14px; line-height: 1.5; color: #5c5f62; margin-bottom: 20px; }}
+            .instruction-box {{ background: #f4f6f8; border-left: 4px solid #008060; padding: 14px; border-radius: 4px; font-size: 13px; margin-top: 20px; }}
+            .btn {{ display: inline-block; background: #008060; color: #ffffff; padding: 12px 20px; border-radius: 4px; text-decoration: none; font-weight: 600; font-size: 14px; margin-top: 10px; }}
+            .btn:hover {{ background: #006e52; }}
         </style>
     </head>
     <body>
@@ -240,7 +245,7 @@ async def merchant_admin_dashboard(shop: Optional[str] = None):
             </div>
 
             <br>
-            <a href="/api/v1/billing/subscribe" class="btn">Manage $39/mo Subscription</a>
+            <a href="{billing_link}" target="_top" class="btn">Manage $39/mo Subscription</a>
         </div>
     </body>
     </html>
@@ -303,17 +308,29 @@ async def start_billing_flow(
     shop: Optional[str] = None,
     code: Optional[str] = None,
 ):
+    """
+    Handles Partner App OAuth authorization and redirects merchant to
+    Shopify's official $39/mo subscription approval screen.
+    """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
     if not target_shop:
         raise HTTPException(status_code=400, detail="Missing shop parameter")
 
-    try:
-        if code:
-            active_token = await exchange_code_for_token(target_shop, code)
-        else:
-            active_token = SHOPIFY_ADMIN_ACCESS_TOKEN
+    # 🟢 1. IF NO OAUTH CODE: Initiate Partner App OAuth flow automatically!
+    if not code:
+        redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
+        auth_url = (
+            f"https://{target_shop}/admin/oauth/authorize?"
+            f"client_id={SHOPIFY_CLIENT_ID}&"
+            f"scope=write_draft_orders,read_draft_orders&"
+            f"redirect_uri={redirect_uri}"
+        )
+        return RedirectResponse(url=auth_url)
 
-        confirmation_url = await create_7day_trial_subscription(target_shop, active_token)
+    # 🟢 2. IF OAUTH CODE PRESENT: Exchange code for Partner App Token & Create Charge!
+    try:
+        partner_token = await exchange_code_for_token(target_shop, code)
+        confirmation_url = await create_7day_trial_subscription(target_shop, partner_token)
         return RedirectResponse(url=confirmation_url)
     except Exception as exc:
         logger.error("Billing error: %s", exc)
