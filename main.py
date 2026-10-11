@@ -1,6 +1,6 @@
 """
 FastAPI Server for EU VAT Shield
-Handles EU VAT validation via VIES & Creates Tax-Exempt Shopify Draft Orders
+Handles VAT Validation, 0% Tax Draft Checkout, OAuth Billing, and Merchant Admin Dashboard
 """
 
 import logging
@@ -9,21 +9,28 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
-# Import our VIES validation function
 from vat_validator import validate_eu_vat
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Shopify Environment Credentials from .env
+# Shopify Configuration
 SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "").rstrip("/")
 SHOPIFY_ADMIN_ACCESS_TOKEN = os.environ.get("SHOPIFY_ADMIN_ACCESS_TOKEN", "")
+SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "e5d2cc0cbb67a7b24c63de9aca610ff4")
+SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+
+# App Subscription Pricing Settings
+PLAN_NAME = "EU VAT Shield Unlimited B2B"
+PLAN_PRICE = 39.00  # $39.00 USD / month
+TRIAL_DAYS = 7     # 7 Days 100% Free Trial
 
 app = FastAPI(
     title="EU VAT Shield API",
@@ -34,7 +41,7 @@ app = FastAPI(
 # --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows fetch requests from Shopify storefronts
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -82,7 +89,24 @@ class ExemptCheckoutResponse(BaseModel):
     error_code: Optional[str] = None
 
 
-# --- Helper: Call Shopify Admin API to create Draft Order ---
+# --- Helper: Exchange OAuth Code for Partner App Access Token ---
+async def exchange_code_for_token(shop: str, code: str) -> str:
+    url = f"https://{shop}/admin/oauth/access_token"
+    payload = {
+        "client_id": SHOPIFY_CLIENT_ID,
+        "client_secret": SHOPIFY_CLIENT_SECRET,
+        "code": code,
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(url, json=payload)
+        data = res.json()
+    token = data.get("access_token")
+    if not token:
+        raise Exception(f"OAuth Exchange Failed: {data}")
+    return token
+
+
+# --- Helper: Create Shopify Draft Order ---
 async def create_shopify_draft_order(
     line_items: list[dict],
     vat_number: str,
@@ -90,13 +114,12 @@ async def create_shopify_draft_order(
     customer_email: Optional[str] = None,
 ) -> dict:
     if not SHOPIFY_SHOP_DOMAIN or not SHOPIFY_ADMIN_ACCESS_TOKEN:
-        raise ValueError("Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN in .env file.")
+        raise ValueError("Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN")
 
     url = f"https://{SHOPIFY_SHOP_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/draft_orders.json"
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
         "Content-Type": "application/json",
-        "Accept": "application/json",
     }
 
     normalized_items = [
@@ -108,7 +131,7 @@ async def create_shopify_draft_order(
     payload = {
         "draft_order": {
             "line_items": normalized_items,
-            "tax_exempt": True,  # <-- Removes 100% of tax at checkout
+            "tax_exempt": True,
             "note": f"EU B2B Tax-Exempt Order. Validated VAT: {vat_number} ({company_label})",
             "tags": "eu-vat-exempt, b2b",
             "note_attributes": [
@@ -125,7 +148,6 @@ async def create_shopify_draft_order(
         response = await client.post(url, headers=headers, json=payload)
 
     if response.status_code not in (200, 201):
-        logger.error("Shopify Admin API Error: %s", response.text)
         raise HTTPException(
             status_code=response.status_code,
             detail=f"Shopify API Error: {response.text}"
@@ -138,26 +160,108 @@ async def create_shopify_draft_order(
     }
 
 
-# --- Endpoints ---
+# --- Helper: Create 7-Day Free Trial Subscription ---
+async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
+    graphql_url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": token,
+        "Content-Type": "application/json",
+    }
+
+    mutation = """
+    mutation AppSubscriptionCreate($name: String!, $lineItems: [AppSubscriptionLineItemInput!]!, $returnUrl: URL!, $trialDays: Int!, $test: Boolean) {
+      appSubscriptionCreate(name: $name, lineItems: $lineItems, returnUrl: $returnUrl, trialDays: $trialDays, test: $test) {
+        userErrors { field message }
+        confirmationUrl
+      }
+    }
+    """
+
+    variables = {
+        "name": PLAN_NAME,
+        "returnUrl": f"https://{shop_domain}/admin/apps",
+        "trialDays": TRIAL_DAYS,
+        "test": True,  # Set to False when live taking real payment
+        "lineItems": [{
+            "plan": {
+                "appRecurringPricingDetails": {
+                    "price": {"amount": PLAN_PRICE, "currencyCode": "USD"},
+                    "interval": "EVERY_30_DAYS"
+                }
+            }
+        }]
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(graphql_url, headers=headers, json={"query": mutation, "variables": variables})
+        data = res.json()
+
+    result = data.get("data", {}).get("appSubscriptionCreate", {})
+    confirmation_url = result.get("confirmationUrl")
+
+    if not confirmation_url:
+        errors = result.get("userErrors", [])
+        logger.error("Subscription Error: %s", errors)
+        raise Exception(f"Subscription Error: {errors}")
+
+    return confirmation_url
+
+
+# --- Routes ---
+
+# 🔴 MERCHANTS EMBEDDED DASHBOARD (Fixes the 404 "Not Found" inside Shopify Admin)
+@app.get("/", response_class=HTMLResponse)
+async def merchant_admin_dashboard(shop: Optional[str] = None):
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>EU VAT Shield Admin</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f6f6f7; padding: 40px; color: #202223; }
+            .card { background: #ffffff; border-radius: 8px; border: 1px solid #e1e3e5; padding: 32px; max-width: 550px; margin: 20px auto; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+            .status-badge { display: inline-block; background: #e6f4ea; color: #007f5f; padding: 6px 12px; border-radius: 20px; font-weight: 600; font-size: 13px; margin-bottom: 16px; }
+            h1 { font-size: 20px; margin: 0 0 8px 0; }
+            p { font-size: 14px; line-height: 1.5; color: #5c5f62; margin-bottom: 20px; }
+            .instruction-box { background: #f4f6f8; border-left: 4px solid #008060; padding: 14px; border-radius: 4px; font-size: 13px; margin-top: 20px; }
+            .btn { display: inline-block; background: #008060; color: #ffffff; padding: 10px 18px; border-radius: 4px; text-decoration: none; font-weight: 600; font-size: 14px; margin-top: 10px; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <span class="status-badge">● EU VIES Validation Engine Active</span>
+            <h1>EU VAT Shield is Protected & Running</h1>
+            <p>Your store is configured for 0% tax B2B checkout automation. European business customers entering valid VAT IDs will automatically receive tax-exempt orders.</p>
+            
+            <div class="instruction-box">
+                <strong>Theme Setup Instructions:</strong><br>
+                Go to <em>Online Store → Themes → Customize → Cart Page</em> and add the <strong>EU VAT Shield</strong> app section/block.
+            </div>
+
+            <br>
+            <a href="/api/v1/billing/subscribe" class="btn">Manage $39/mo Subscription</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "service": "vat-shield"}
 
 
-@app.post("/api/v1/validate-vat", response_model=VatCheckResponse, tags=["VAT"])
+@app.post("/api/v1/validate-vat", response_model=VatCheckResponse)
 async def validate_vat(request: VatCheckRequest):
-    """1. Validate EU VAT via VIES API"""
     return validate_eu_vat(
         country_code=request.country_code,
         vat_number=request.vat_number
     )
 
 
-@app.post("/api/v1/create-exempt-checkout", response_model=ExemptCheckoutResponse, tags=["Checkout"])
+@app.post("/api/v1/create-exempt-checkout", response_model=ExemptCheckoutResponse)
 async def create_exempt_checkout(request: ExemptCheckoutRequest):
-    """2. Intercept Checkout and return 0% Tax Draft Order invoice URL"""
-
-    # Server-Side Re-validation for safety
     if request.revalidate_vat:
         raw_vat = request.vat_number.strip().upper()
         cc = request.country_code.strip().upper()
@@ -193,78 +297,23 @@ async def create_exempt_checkout(request: ExemptCheckoutRequest):
             error_code="DRAFT_ORDER_FAILED"
         )
 
-        # =====================================================================
-# SHOPIFY RECURRING BILLING ENGINE ($39/mo + 7-DAY FREE TRIAL)
-# =====================================================================
-
-PLAN_NAME = "EU VAT Shield Unlimited B2B"
-PLAN_PRICE = 39.00  # $39.00 USD / month
-TRIAL_DAYS = 7     # 7 Days 100% Free Trial
-
-async def create_7day_trial_subscription(shop_domain: str) -> str:
-    """
-    Creates a Shopify Recurring Application Charge with a 7-Day Free Trial.
-    Returns the official Shopify confirmation URL for merchant approval.
-    """
-    graphql_url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
-    headers = {
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-        "Content-Type": "application/json",
-    }
-
-    # Shopify GraphQL Mutation for App Subscriptions
-    mutation = """
-    mutation AppSubscriptionCreate($name: String!, $lineItems: [AppSubscriptionLineItemInput!]!, $returnUrl: URL!, $trialDays: Int!, $test: Boolean) {
-      appSubscriptionCreate(name: $name, lineItems: $lineItems, returnUrl: $returnUrl, trialDays: $trialDays, test: $test) {
-        userErrors { field message }
-        confirmationUrl
-      }
-    }
-    """
-
-    # Set test=True during development (no real charges), test=False for live sales
-    variables = {
-        "name": PLAN_NAME,
-        "returnUrl": f"https://{shop_domain}/admin/apps",
-        "trialDays": TRIAL_DAYS,
-        "test": True,  # Set to False when taking real money from merchants
-        "lineItems": [{
-            "plan": {
-                "appRecurringPricingDetails": {
-                    "price": {"amount": PLAN_PRICE, "currencyCode": "USD"},
-                    "interval": "EVERY_30_DAYS"
-                }
-            }
-        }]
-    }
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(graphql_url, headers=headers, json={"query": mutation, "variables": variables})
-        data = res.json()
-
-    result = data.get("data", {}).get("appSubscriptionCreate", {})
-    confirmation_url = result.get("confirmationUrl")
-
-    if not confirmation_url:
-        errors = result.get("userErrors", [])
-        logger.error("Subscription Creation Failed: %s", errors)
-        raise Exception(f"Subscription Error: {errors}")
-
-    return confirmation_url
-
 
 @app.get("/api/v1/billing/subscribe")
-async def start_billing_flow(shop: Optional[str] = None):
-    """
-    Merchant redirected here after installation to approve $39/mo subscription.
-    """
+async def start_billing_flow(
+    shop: Optional[str] = None,
+    code: Optional[str] = None,
+):
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
     if not target_shop:
         raise HTTPException(status_code=400, detail="Missing shop parameter")
 
     try:
-        confirmation_url = await create_7day_trial_subscription(target_shop)
-        from fastapi.responses import RedirectResponse
+        if code:
+            active_token = await exchange_code_for_token(target_shop, code)
+        else:
+            active_token = SHOPIFY_ADMIN_ACCESS_TOKEN
+
+        confirmation_url = await create_7day_trial_subscription(target_shop, active_token)
         return RedirectResponse(url=confirmation_url)
     except Exception as exc:
         logger.error("Billing error: %s", exc)
