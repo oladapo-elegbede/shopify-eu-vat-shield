@@ -1,0 +1,21 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "a4717df5d62aa9827820991a0ff2b280"
+application_url = "https://shopify.dev/apps/default-app-home"
+embedded = true
+name = "EU VAT Shield Org"
+
+[webhooks]
+api_version = "2027-01"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_draft_orders,write_draft_orders"
+
+[auth]
+redirect_urls = [
+  "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
+]
+
+[build]
+automatically_update_urls_on_dev = true

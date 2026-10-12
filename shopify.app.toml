@@ -1,9 +1,9 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "e5d2cc0cbb67a7b24c63de9aca610ff4"
+client_id = "a4717df5d62aa9827820991a0ff2b280"
 application_url = "https://shopify-eu-vat-shield.onrender.com"
 embedded = true
-name = "EU VAT Shield"
+name = "EU VAT Shield Org"
 
 [webhooks]
 api_version = "2024-10"

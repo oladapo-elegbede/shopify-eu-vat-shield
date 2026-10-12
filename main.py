@@ -1,6 +1,6 @@
 """
 FastAPI Server for EU VAT Shield
-Handles VAT Validation, 0% Tax Draft Checkout, OAuth Partner Token Exchange, and Billing
+Handles VAT Validation, 0% Tax Draft Checkout, OAuth Partner Billing, and Merchant Admin Dashboard
 """
 
 import logging
@@ -182,7 +182,7 @@ async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
         "name": PLAN_NAME,
         "returnUrl": f"https://{shop_domain}/admin/apps",
         "trialDays": TRIAL_DAYS,
-        "test": True,  # Set to False when taking real money
+        "test": True,  # Set to False when taking real money on Shopify App Store
         "lineItems": [{
             "plan": {
                 "appRecurringPricingDetails": {
@@ -210,7 +210,7 @@ async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
 
 # --- Routes ---
 
-# 🔴 MERCHANTS EMBEDDED DASHBOARD
+# 🔴 MERCHANT EMBEDDED DASHBOARD
 @app.get("/", response_class=HTMLResponse)
 async def merchant_admin_dashboard(shop: Optional[str] = None):
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
@@ -309,29 +309,38 @@ async def start_billing_flow(
     code: Optional[str] = None,
 ):
     """
-    Handles Partner App OAuth authorization and redirects merchant to
-    Shopify's official $39/mo subscription approval screen.
+    Smart Billing Flow:
+    1. If code is present, exchange for Partner Token and trigger subscription.
+    2. If env token works, use it directly.
+    3. Otherwise, fallback smoothly to OAuth redirect.
     """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
     if not target_shop:
         raise HTTPException(status_code=400, detail="Missing shop parameter")
 
-    # 🟢 1. IF NO OAUTH CODE: Initiate Partner App OAuth flow automatically!
-    if not code:
-        redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
-        auth_url = (
-            f"https://{target_shop}/admin/oauth/authorize?"
-            f"client_id={SHOPIFY_CLIENT_ID}&"
-            f"scope=write_draft_orders,read_draft_orders&"
-            f"redirect_uri={redirect_uri}"
-        )
-        return RedirectResponse(url=auth_url)
+    # Case 1: OAuth Code Present -> Exchange for Partner Token
+    if code and SHOPIFY_CLIENT_SECRET:
+        try:
+            partner_token = await exchange_code_for_token(target_shop, code)
+            confirmation_url = await create_7day_trial_subscription(target_shop, partner_token)
+            return RedirectResponse(url=confirmation_url)
+        except Exception as exc:
+            logger.error("OAuth Billing failed: %s", exc)
 
-    # 🟢 2. IF OAUTH CODE PRESENT: Exchange code for Partner App Token & Create Charge!
-    try:
-        partner_token = await exchange_code_for_token(target_shop, code)
-        confirmation_url = await create_7day_trial_subscription(target_shop, partner_token)
-        return RedirectResponse(url=confirmation_url)
-    except Exception as exc:
-        logger.error("Billing error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+    # Case 2: Try using SHOPIFY_ADMIN_ACCESS_TOKEN directly
+    if SHOPIFY_ADMIN_ACCESS_TOKEN:
+        try:
+            confirmation_url = await create_7day_trial_subscription(target_shop, SHOPIFY_ADMIN_ACCESS_TOKEN)
+            return RedirectResponse(url=confirmation_url)
+        except Exception as exc:
+            logger.warning("Env token subscription attempt failed, falling back to OAuth: %s", exc)
+
+    # Case 3: Fallback -> Initiate OAuth authorization flow
+    redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
+    auth_url = (
+        f"https://{target_shop}/admin/oauth/authorize?"
+        f"client_id={SHOPIFY_CLIENT_ID}&"
+        f"scope=write_draft_orders,read_draft_orders&"
+        f"redirect_uri={redirect_uri}"
+    )
+    return RedirectResponse(url=auth_url)
