@@ -21,7 +21,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Shopify Configuration
-SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "").rstrip("/")
+SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "vat-shield-fresh-dev.myshopify.com").rstrip("/")
 SHOPIFY_ADMIN_ACCESS_TOKEN = os.environ.get("SHOPIFY_ADMIN_ACCESS_TOKEN", "")
 SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "a4717df5d62aa9827820991a0ff2b280")
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
@@ -309,33 +309,56 @@ async def start_billing_flow(
     code: Optional[str] = None,
 ):
     """
-    Smart Billing Flow:
-    1. If code is present, exchange for Partner Token and trigger subscription.
-    2. If env token works, use it directly.
-    3. Otherwise, fallback smoothly to OAuth redirect.
+    Handles installation OAuth callback & subscription approval.
+    Uses JavaScript window.top.location.href to break out of Shopify Admin iframe
+    and avoid Chrome third-party cookie blocking.
     """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
     if not target_shop:
         raise HTTPException(status_code=400, detail="Missing shop parameter")
 
-    # Case 1: OAuth Code Present -> Exchange for Partner Token
+    # 1. If OAuth code present -> exchange code and redirect to billing
     if code and SHOPIFY_CLIENT_SECRET:
         try:
             partner_token = await exchange_code_for_token(target_shop, code)
             confirmation_url = await create_7day_trial_subscription(target_shop, partner_token)
-            return RedirectResponse(url=confirmation_url)
+            return HTMLResponse(content=f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <script type="text/javascript">
+                        window.top.location.href = "{confirmation_url}";
+                    </script>
+                </head>
+                <body>
+                    <p>Redirecting to subscription approval...</p>
+                </body>
+                </html>
+            """)
         except Exception as exc:
             logger.error("OAuth Billing failed: %s", exc)
 
-    # Case 2: Try using SHOPIFY_ADMIN_ACCESS_TOKEN directly
-    if SHOPIFY_ADMIN_ACCESS_TOKEN:
+    # 2. Try directly creating subscription with env token
+    if SHOPIFY_ADMIN_ACCESS_TOKEN and not code:
         try:
             confirmation_url = await create_7day_trial_subscription(target_shop, SHOPIFY_ADMIN_ACCESS_TOKEN)
-            return RedirectResponse(url=confirmation_url)
+            return HTMLResponse(content=f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <script type="text/javascript">
+                        window.top.location.href = "{confirmation_url}";
+                    </script>
+                </head>
+                <body>
+                    <p>Redirecting to subscription approval...</p>
+                </body>
+                </html>
+            """)
         except Exception as exc:
-            logger.warning("Env token subscription attempt failed, falling back to OAuth: %s", exc)
+            logger.warning("Env token subscription attempt failed, initiating OAuth: %s", exc)
 
-    # Case 3: Fallback -> Initiate OAuth authorization flow
+    # 3. Fallback -> Trigger OAuth flow via top-level JS navigation
     redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
     auth_url = (
         f"https://{target_shop}/admin/oauth/authorize?"
@@ -343,4 +366,16 @@ async def start_billing_flow(
         f"scope=write_draft_orders,read_draft_orders&"
         f"redirect_uri={redirect_uri}"
     )
-    return RedirectResponse(url=auth_url)
+    return HTMLResponse(content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <script type="text/javascript">
+                window.top.location.href = "{auth_url}";
+            </script>
+        </head>
+        <body>
+            <p>Redirecting to authorization...</p>
+        </body>
+        </html>
+    """)
