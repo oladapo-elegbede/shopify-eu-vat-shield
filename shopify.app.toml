@@ -1,6 +1,6 @@
 name = "EU VAT Shield"
 application_url = "https://shopify-eu-vat-shield.onrender.com"
-embedded = false
+embedded = true
 
 [webhooks]
 api_version = "2024-10"
@@ -15,3 +15,16 @@ redirect_urls = [
 
 [build]
 automatically_update_urls_on_dev = true
+
+# =====================================================================
+# 🟢 NATIVE SHOPIFY MANAGED BILLING ($39/mo + 7-DAY FREE TRIAL)
+# =====================================================================
+[billing]
+required = true
+
+[[billing.plans]]
+name = "EU VAT Shield Unlimited B2B"
+amount = 39.00
+currency = "USD"
+interval = "EVERY_30_DAYS"
+trial_days = 7

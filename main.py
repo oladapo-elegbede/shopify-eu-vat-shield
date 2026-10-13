@@ -1,6 +1,6 @@
 """
 FastAPI Server for EU VAT Shield
-Handles VAT Validation, 0% Tax Draft Checkout, OAuth Partner Billing, and Merchant Admin Dashboard
+Handles VAT Validation, 0% Tax Draft Checkout, and 7-Day Free Trial Recurring Billing
 """
 
 import logging
@@ -23,8 +23,6 @@ logger = logging.getLogger(__name__)
 # Shopify Configuration
 SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "vat-test-engine.myshopify.com").rstrip("/")
 SHOPIFY_ADMIN_ACCESS_TOKEN = os.environ.get("SHOPIFY_ADMIN_ACCESS_TOKEN", "")
-SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "e5d2cc0cbb67a7b24c63de9aca610ff4")
-SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 
 # App Subscription Pricing Settings
@@ -89,24 +87,6 @@ class ExemptCheckoutResponse(BaseModel):
     error_code: Optional[str] = None
 
 
-# --- Helper: Exchange OAuth Code for Partner App Access Token ---
-async def exchange_code_for_token(shop: str, code: str) -> str:
-    url = f"https://{shop}/admin/oauth/access_token"
-    payload = {
-        "client_id": SHOPIFY_CLIENT_ID,
-        "client_secret": SHOPIFY_CLIENT_SECRET,
-        "code": code,
-    }
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(url, json=payload)
-        data = res.json()
-    token = data.get("access_token")
-    if not token:
-        logger.error("OAuth exchange failed: %s", data)
-        raise Exception(f"OAuth Exchange Failed: {data}")
-    return token
-
-
 # --- Helper: Create Shopify Draft Order ---
 async def create_shopify_draft_order(
     line_items: list[dict],
@@ -161,49 +141,34 @@ async def create_shopify_draft_order(
     }
 
 
-# --- Helper: Create 7-Day Free Trial Subscription ---
-async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
-    graphql_url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+# --- Helper: Create 7-Day Free Trial Recurring Charge via REST API ---
+async def create_recurring_charge(shop_domain: str, token: str) -> str:
+    url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/recurring_application_charges.json"
     headers = {
         "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
     }
 
-    mutation = """
-    mutation AppSubscriptionCreate($name: String!, $lineItems: [AppSubscriptionLineItemInput!]!, $returnUrl: URL!, $trialDays: Int!, $test: Boolean) {
-      appSubscriptionCreate(name: $name, lineItems: $lineItems, returnUrl: $returnUrl, trialDays: $trialDays, test: $test) {
-        userErrors { field message }
-        confirmationUrl
-      }
-    }
-    """
-
-    variables = {
-        "name": PLAN_NAME,
-        "returnUrl": f"https://{shop_domain}/admin/apps",
-        "trialDays": TRIAL_DAYS,
-        "test": True,
-      "lineItems": [{
-            "plan": {
-                "appRecurringPricingDetails": {
-                    "price": {"amount": PLAN_PRICE, "currencyCode": "USD"},
-                    "interval": "EVERY_30_DAYS"
-                }
-            }
-        }]
+    payload = {
+        "recurring_application_charge": {
+            "name": PLAN_NAME,
+            "price": PLAN_PRICE,
+            "return_url": f"https://{shop_domain}/admin/apps",
+            "trial_days": TRIAL_DAYS,
+            "test": True,  # Set to False when taking real money on Shopify App Store
+        }
     }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(graphql_url, headers=headers, json={"query": mutation, "variables": variables})
+        res = await client.post(url, headers=headers, json=payload)
         data = res.json()
 
-    data_obj = data.get("data") or {}
-    sub_create = data_obj.get("appSubscriptionCreate") or {}
-    confirmation_url = sub_create.get("confirmationUrl")
+    charge = data.get("recurring_application_charge", {})
+    confirmation_url = charge.get("confirmation_url")
 
     if not confirmation_url:
-        errors = sub_create.get("userErrors") or data.get("errors") or data
-        raise Exception(f"Subscription Error: {errors}")
+        logger.error("Charge Creation Failed: %s", data)
+        raise Exception(f"Charge Error: {data}")
 
     return confirmation_url
 
@@ -304,65 +269,35 @@ async def create_exempt_checkout(request: ExemptCheckoutRequest):
 
 
 @app.get("/api/v1/billing/subscribe")
-async def start_billing_flow(
-    shop: Optional[str] = None,
-    code: Optional[str] = None,
-):
+async def start_billing_flow(shop: Optional[str] = None):
     """
-    Handles installation OAuth callback & subscription approval.
-    Includes grant_options[]=value to request expiring offline tokens.
-    Breaks out of Shopify Admin iframe via window.top.location.href.
+    Creates $39/mo 7-Day Free Trial Charge via Shopify REST Admin API.
+    Breaks out of iframe via JS window.top.location.href.
     """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
-    if not target_shop:
-        return HTMLResponse("<div style='padding:40px;font-family:sans-serif;'><h3>Error: Missing shop parameter</h3></div>")
+    if not target_shop or not SHOPIFY_ADMIN_ACCESS_TOKEN:
+        raise HTTPException(status_code=400, detail="Missing shop or access token")
 
-    # 1. OAuth Code Present -> Exchange code for Expiring Partner Token & Create Subscription
-    if code and SHOPIFY_CLIENT_SECRET:
-        try:
-            partner_token = await exchange_code_for_token(target_shop, code)
-            confirmation_url = await create_7day_trial_subscription(target_shop, partner_token)
-            return HTMLResponse(content=f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <script type="text/javascript">
-                        window.top.location.href = "{confirmation_url}";
-                    </script>
-                </head>
-                <body>
-                    <p>Redirecting to subscription approval...</p>
-                </body>
-                </html>
-            """)
-        except Exception as exc:
-            logger.error("OAuth Billing failed: %s", exc)
-            return HTMLResponse(content=f"""
-                <div style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: 0 auto;">
-                    <h2>Billing Notice</h2>
-                    <p>Subscription charge creation status: <strong>{exc}</strong></p>
-                </div>
-            """)
-
-    # 2. Trigger OAuth flow WITH grant_options[]=value
-    redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
-    auth_url = (
-        f"https://{target_shop}/admin/oauth/authorize?"
-        f"client_id={SHOPIFY_CLIENT_ID}&"
-        f"scope=write_draft_orders,read_draft_orders&"
-        f"redirect_uri={redirect_uri}&"
-        f"grant_options[]=value"
-    )
-    return HTMLResponse(content=f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <script type="text/javascript">
-                window.top.location.href = "{auth_url}";
-            </script>
-        </head>
-        <body>
-            <p>Redirecting to authorization...</p>
-        </body>
-        </html>
-    """)
+    try:
+        confirmation_url = await create_recurring_charge(target_shop, SHOPIFY_ADMIN_ACCESS_TOKEN)
+        return HTMLResponse(content=f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <script type="text/javascript">
+                    window.top.location.href = "{confirmation_url}";
+                </script>
+            </head>
+            <body>
+                <p>Redirecting to $39/mo subscription approval...</p>
+            </body>
+            </html>
+        """)
+    except Exception as exc:
+        logger.error("REST Billing Error: %s", exc)
+        return HTMLResponse(content=f"""
+            <div style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: 0 auto;">
+                <h2>Billing Notice</h2>
+                <p>Could not generate charge: <strong>{exc}</strong></p>
+            </div>
+        """)
