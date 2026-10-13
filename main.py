@@ -182,7 +182,7 @@ async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
         "name": PLAN_NAME,
         "returnUrl": f"https://{shop_domain}/admin/apps",
         "trialDays": TRIAL_DAYS,
-        "test": True,
+        "test": True,  # Set to False when taking real money on Shopify App Store
         "lineItems": [{
             "plan": {
                 "appRecurringPricingDetails": {
@@ -310,15 +310,16 @@ async def start_billing_flow(
 ):
     """
     Handles installation OAuth callback & subscription approval.
-    Breaks out of Shopify Admin iframe via window.top.location.href
-    No more infinite OAuth redirect loops!
+    Includes grant_options[]=value to request expiring offline tokens
+    required by Shopify's 2024 GraphQL Billing API.
+    Breaks out of Shopify Admin iframe via window.top.location.href.
     """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
     if not target_shop:
         return HTMLResponse("<div style='padding:40px;font-family:sans-serif;'><h3>Error: Missing shop parameter</h3></div>")
 
-    # 1. OAuth Code Present -> Exchange code for Partner App Token & Create Subscription
-    if code:
+    # 1. OAuth Code Present -> Exchange code for Expiring Partner Token & Create Subscription
+    if code and SHOPIFY_CLIENT_SECRET:
         try:
             partner_token = await exchange_code_for_token(target_shop, code)
             confirmation_url = await create_7day_trial_subscription(target_shop, partner_token)
@@ -344,33 +345,14 @@ async def start_billing_flow(
                 </div>
             """)
 
-    # 2. Try directly creating subscription with env token
-    if SHOPIFY_ADMIN_ACCESS_TOKEN and not code:
-        try:
-            confirmation_url = await create_7day_trial_subscription(target_shop, SHOPIFY_ADMIN_ACCESS_TOKEN)
-            return HTMLResponse(content=f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <script type="text/javascript">
-                        window.top.location.href = "{confirmation_url}";
-                    </script>
-                </head>
-                <body>
-                    <p>Redirecting to subscription approval...</p>
-                </body>
-                </html>
-            """)
-        except Exception as exc:
-            logger.warning("Env token subscription failed, initiating OAuth: %s", exc)
-
-    # 3. Fallback -> Trigger OAuth flow via top-level JS navigation
+    # 2. Trigger OAuth flow with grant_options[]=value (Expiring Offline Access Token)
     redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
     auth_url = (
         f"https://{target_shop}/admin/oauth/authorize?"
         f"client_id={SHOPIFY_CLIENT_ID}&"
         f"scope=write_draft_orders,read_draft_orders&"
-        f"redirect_uri={redirect_uri}"
+        f"redirect_uri={redirect_uri}&"
+        f"grant_options[]=value"
     )
     return HTMLResponse(content=f"""
         <!DOCTYPE html>
