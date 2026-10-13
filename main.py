@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Shopify Configuration
 SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "vat-shield-fresh-dev.myshopify.com").rstrip("/")
 SHOPIFY_ADMIN_ACCESS_TOKEN = os.environ.get("SHOPIFY_ADMIN_ACCESS_TOKEN", "")
-SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "e5d2cc0cbb67a7b24c63de9aca610ff4")
+SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "a4717df5d62aa9827820991a0ff2b280")
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 
@@ -197,13 +197,21 @@ async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
         res = await client.post(graphql_url, headers=headers, json={"query": mutation, "variables": variables})
         data = res.json()
 
+    # Log GraphQL Payload for complete debugging visibility
+    logger.info("GraphQL Billing Response: %s", data)
+
+    # 1. Parse top-level GraphQL API errors
+    if "errors" in data and data["errors"]:
+        raise Exception(f"GraphQL Top-Level Error: {data['errors']}")
+
     data_obj = data.get("data") or {}
     sub_create = data_obj.get("appSubscriptionCreate") or {}
     confirmation_url = sub_create.get("confirmationUrl")
 
+    # 2. Parse userErrors inside mutation response
     if not confirmation_url:
-        errors = sub_create.get("userErrors") or data.get("errors") or data
-        raise Exception(f"Subscription Error: {errors}")
+        user_errors = sub_create.get("userErrors", [])
+        raise Exception(f"Subscription UserErrors: {user_errors}")
 
     return confirmation_url
 
@@ -310,8 +318,7 @@ async def start_billing_flow(
 ):
     """
     Handles installation OAuth callback & subscription approval.
-    Includes grant_options[]=value to request expiring offline tokens
-    required by Shopify's 2024 GraphQL Billing API.
+    Forces 'grant_options[]=value' to request expiring offline tokens required by Shopify.
     Breaks out of Shopify Admin iframe via window.top.location.href.
     """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
@@ -341,11 +348,11 @@ async def start_billing_flow(
             return HTMLResponse(content=f"""
                 <div style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: 0 auto;">
                     <h2>Billing Notice</h2>
-                    <p>Could not generate automatic subscription charge: <strong>{exc}</strong></p>
+                    <p>Subscription charge creation status: <strong>{exc}</strong></p>
                 </div>
             """)
 
-    # 2. Trigger OAuth flow with grant_options[]=value (Expiring Offline Access Token)
+    # 2. Trigger OAuth flow explicitly requesting expiring offline tokens (grant_options[]=value)
     redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
     auth_url = (
         f"https://{target_shop}/admin/oauth/authorize?"
