@@ -21,7 +21,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Shopify Configuration
-SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "vat-test-engine.myshopify.com").rstrip("/")
+SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "vat-shield-fresh-dev.myshopify.com").rstrip("/")
 SHOPIFY_ADMIN_ACCESS_TOKEN = os.environ.get("SHOPIFY_ADMIN_ACCESS_TOKEN", "")
 SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "e5d2cc0cbb67a7b24c63de9aca610ff4")
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
@@ -182,7 +182,7 @@ async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
         "name": PLAN_NAME,
         "returnUrl": f"https://{shop_domain}/admin/apps",
         "trialDays": TRIAL_DAYS,
-        "test": True,  # Set to False when taking real money on Shopify App Store
+        "test": True,
         "lineItems": [{
             "plan": {
                 "appRecurringPricingDetails": {
@@ -197,20 +197,13 @@ async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
         res = await client.post(graphql_url, headers=headers, json={"query": mutation, "variables": variables})
         data = res.json()
 
-    # Log GraphQL Response for complete visibility
-    logger.info("GraphQL Billing Response: %s", data)
-
-    # 1. Check top-level GraphQL errors
-    if "errors" in data and data["errors"]:
-        raise Exception(f"GraphQL Error: {data['errors']}")
-
     data_obj = data.get("data") or {}
     sub_create = data_obj.get("appSubscriptionCreate") or {}
     confirmation_url = sub_create.get("confirmationUrl")
 
     if not confirmation_url:
-        user_errors = sub_create.get("userErrors", [])
-        raise Exception(f"Subscription UserErrors: {user_errors} | Full Payload: {data}")
+        errors = sub_create.get("userErrors") or data.get("errors") or data
+        raise Exception(f"Subscription Error: {errors}")
 
     return confirmation_url
 
@@ -318,14 +311,14 @@ async def start_billing_flow(
     """
     Handles installation OAuth callback & subscription approval.
     Breaks out of Shopify Admin iframe via window.top.location.href
-    to avoid Chrome SameSite cookie blocking.
+    No more infinite OAuth redirect loops!
     """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
     if not target_shop:
-        raise HTTPException(status_code=400, detail="Missing shop parameter")
+        return HTMLResponse("<div style='padding:40px;font-family:sans-serif;'><h3>Error: Missing shop parameter</h3></div>")
 
     # 1. OAuth Code Present -> Exchange code for Partner App Token & Create Subscription
-    if code and SHOPIFY_CLIENT_SECRET:
+    if code:
         try:
             partner_token = await exchange_code_for_token(target_shop, code)
             confirmation_url = await create_7day_trial_subscription(target_shop, partner_token)
@@ -344,8 +337,34 @@ async def start_billing_flow(
             """)
         except Exception as exc:
             logger.error("OAuth Billing failed: %s", exc)
+            return HTMLResponse(content=f"""
+                <div style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: 0 auto;">
+                    <h2>Billing Notice</h2>
+                    <p>Could not generate automatic subscription charge: <strong>{exc}</strong></p>
+                </div>
+            """)
 
-    # 2. Trigger fresh OAuth authorization flow via top-level JS navigation
+    # 2. Try directly creating subscription with env token
+    if SHOPIFY_ADMIN_ACCESS_TOKEN and not code:
+        try:
+            confirmation_url = await create_7day_trial_subscription(target_shop, SHOPIFY_ADMIN_ACCESS_TOKEN)
+            return HTMLResponse(content=f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <script type="text/javascript">
+                        window.top.location.href = "{confirmation_url}";
+                    </script>
+                </head>
+                <body>
+                    <p>Redirecting to subscription approval...</p>
+                </body>
+                </html>
+            """)
+        except Exception as exc:
+            logger.warning("Env token subscription failed, initiating OAuth: %s", exc)
+
+    # 3. Fallback -> Trigger OAuth flow via top-level JS navigation
     redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
     auth_url = (
         f"https://{target_shop}/admin/oauth/authorize?"
