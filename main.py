@@ -1,6 +1,6 @@
 """
 FastAPI Server for EU VAT Shield
-Handles VAT Validation, 0% Tax Draft Checkout, OAuth Partner Token Exchange, and $39/mo GraphQL Billing
+Handles VAT Validation, 0% Tax Draft Checkout, Partner OAuth Exchange, and REST Recurring Billing
 """
 
 import logging
@@ -89,7 +89,7 @@ class ExemptCheckoutResponse(BaseModel):
     error_code: Optional[str] = None
 
 
-# --- Helper: Exchange OAuth Code for Partner App Access Token ---
+# --- Helper: Exchange OAuth Code for Partner Access Token ---
 async def exchange_code_for_token(shop: str, code: str) -> str:
     url = f"https://{shop}/admin/oauth/access_token"
     payload = {
@@ -161,55 +161,34 @@ async def create_shopify_draft_order(
     }
 
 
-# --- Helper: Create 7-Day Free Trial Subscription via GraphQL ---
-async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
-    graphql_url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+# --- Helper: Create 7-Day Free Trial Recurring Charge via REST API ---
+async def create_recurring_charge(shop_domain: str, token: str) -> str:
+    url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/recurring_application_charges.json"
     headers = {
         "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
     }
 
-    mutation = """
-    mutation AppSubscriptionCreate($name: String!, $lineItems: [AppSubscriptionLineItemInput!]!, $returnUrl: URL!, $trialDays: Int!, $test: Boolean) {
-      appSubscriptionCreate(name: $name, lineItems: $lineItems, returnUrl: $returnUrl, trialDays: $trialDays, test: $test) {
-        userErrors { field message }
-        confirmationUrl
-      }
-    }
-    """
-
-    variables = {
-        "name": PLAN_NAME,
-        "returnUrl": f"https://{shop_domain}/admin/apps",
-        "trialDays": TRIAL_DAYS,
-        "test": True,  # Set to False when taking real money on Shopify App Store
-        "lineItems": [{
-            "plan": {
-                "appRecurringPricingDetails": {
-                    "price": {"amount": PLAN_PRICE, "currencyCode": "USD"},
-                    "interval": "EVERY_30_DAYS"
-                }
-            }
-        }]
+    payload = {
+        "recurring_application_charge": {
+            "name": PLAN_NAME,
+            "price": PLAN_PRICE,
+            "return_url": f"https://{shop_domain}/admin/apps",
+            "trial_days": TRIAL_DAYS,
+            "test": True,  # Set to False when taking real money on Shopify App Store
+        }
     }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(graphql_url, headers=headers, json={"query": mutation, "variables": variables})
+        res = await client.post(url, headers=headers, json=payload)
         data = res.json()
 
-    # Log GraphQL Response for full debugging visibility
-    logger.info("GraphQL Billing Response: %s", data)
-
-    if "errors" in data and data["errors"]:
-        raise Exception(f"GraphQL API Errors: {data['errors']}")
-
-    data_obj = data.get("data") or {}
-    sub_create = data_obj.get("appSubscriptionCreate") or {}
-    confirmation_url = sub_create.get("confirmationUrl")
+    charge = data.get("recurring_application_charge", {})
+    confirmation_url = charge.get("confirmation_url")
 
     if not confirmation_url:
-        user_errors = sub_create.get("userErrors", [])
-        raise Exception(f"Subscription userErrors: {user_errors} | Full Response: {data}")
+        logger.error("Charge Creation Failed: %s", data)
+        raise Exception(f"Charge Error: {data}")
 
     return confirmation_url
 
@@ -309,26 +288,26 @@ async def create_exempt_checkout(request: ExemptCheckoutRequest):
         )
 
 
-# 🟢 BILLING ENDPOINT (WITH EXPIRING TOKEN OAUTH + IFRAME BREAKOUT)
+# 🟢 BILLING ENDPOINT (REST API RECURRING CHARGES)
 @app.get("/api/v1/billing/subscribe")
 async def start_billing_flow(
     shop: Optional[str] = None,
     code: Optional[str] = None,
 ):
     """
-    Handles installation OAuth callback & subscription approval.
-    Includes grant_options[]=value to request expiring offline tokens required by Shopify GraphQL.
-    Breaks out of Shopify Admin iframe via window.top.location.href.
+    1. Exchanging OAuth code for Partner App Token
+    2. Creating REST Recurring Application Charge ($39/mo + 7-Day Free Trial)
+    3. Redirecting top-level browser window via JavaScript
     """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
     if not target_shop:
         return HTMLResponse("<div style='padding:40px;font-family:sans-serif;'><h3>Error: Missing shop parameter</h3></div>")
 
-    # 1. OAuth Code Present -> Exchange code for Expiring Partner Token & Create Subscription
+    # Step 1: OAuth Code Present -> Exchange for Partner Token & Create REST Charge
     if code and SHOPIFY_CLIENT_SECRET:
         try:
             partner_token = await exchange_code_for_token(target_shop, code)
-            confirmation_url = await create_7day_trial_subscription(target_shop, partner_token)
+            confirmation_url = await create_recurring_charge(target_shop, partner_token)
             return HTMLResponse(content=f"""
                 <!DOCTYPE html>
                 <html>
@@ -343,7 +322,7 @@ async def start_billing_flow(
                 </html>
             """)
         except Exception as exc:
-            logger.error("OAuth Billing failed: %s", exc)
+            logger.error("REST Billing failed: %s", exc)
             return HTMLResponse(content=f"""
                 <div style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: 0 auto;">
                     <h2>Billing Notice</h2>
@@ -351,14 +330,13 @@ async def start_billing_flow(
                 </div>
             """)
 
-    # 2. Trigger OAuth flow WITH grant_options[]=value (Expiring Offline Access Token)
+    # Step 2: Trigger OAuth Flow
     redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
     auth_url = (
         f"https://{target_shop}/admin/oauth/authorize?"
         f"client_id={SHOPIFY_CLIENT_ID}&"
         f"scope=write_draft_orders,read_draft_orders&"
-        f"redirect_uri={redirect_uri}&"
-        f"grant_options[]=value"
+        f"redirect_uri={redirect_uri}"
     )
     return HTMLResponse(content=f"""
         <!DOCTYPE html>
