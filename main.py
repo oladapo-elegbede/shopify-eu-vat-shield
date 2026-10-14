@@ -1,6 +1,6 @@
 """
 FastAPI Server for EU VAT Shield
-Handles VAT Validation, 0% Tax Draft Checkout, and 7-Day Free Trial Recurring Billing
+Handles VAT Validation, 0% Tax Draft Checkout, OAuth Partner Token Exchange, and 7-Day Free Trial Billing
 """
 
 import logging
@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 # Shopify Configuration
 SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "vat-test-engine.myshopify.com").rstrip("/")
 SHOPIFY_ADMIN_ACCESS_TOKEN = os.environ.get("SHOPIFY_ADMIN_ACCESS_TOKEN", "")
+SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "e5d2cc0cbb67a7b24c63de9aca610ff4")
+SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 
 # App Subscription Pricing Settings
@@ -85,6 +87,24 @@ class ExemptCheckoutResponse(BaseModel):
     draft_order_id: Optional[int] = None
     error: Optional[str] = None
     error_code: Optional[str] = None
+
+
+# --- Helper: Exchange OAuth Code for Partner App Access Token ---
+async def exchange_code_for_token(shop: str, code: str) -> str:
+    url = f"https://{shop}/admin/oauth/access_token"
+    payload = {
+        "client_id": SHOPIFY_CLIENT_ID,
+        "client_secret": SHOPIFY_CLIENT_SECRET,
+        "code": code,
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.post(url, json=payload)
+        data = res.json()
+    token = data.get("access_token")
+    if not token:
+        logger.error("OAuth exchange failed: %s", data)
+        raise Exception(f"OAuth Exchange Failed: {data}")
+    return token
 
 
 # --- Helper: Create Shopify Draft Order ---
@@ -269,35 +289,64 @@ async def create_exempt_checkout(request: ExemptCheckoutRequest):
 
 
 @app.get("/api/v1/billing/subscribe")
-async def start_billing_flow(shop: Optional[str] = None):
+async def start_billing_flow(
+    shop: Optional[str] = None,
+    code: Optional[str] = None,
+):
     """
-    Creates $39/mo 7-Day Free Trial Charge via Shopify REST Admin API.
+    Handles installation OAuth callback & subscription approval.
+    Exchanges OAuth code for Partner App Token and creates REST recurring charge.
     Breaks out of iframe via JS window.top.location.href.
     """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
-    if not target_shop or not SHOPIFY_ADMIN_ACCESS_TOKEN:
-        raise HTTPException(status_code=400, detail="Missing shop or access token")
+    if not target_shop:
+        return HTMLResponse("<div style='padding:40px;font-family:sans-serif;'><h3>Error: Missing shop parameter</h3></div>")
 
-    try:
-        confirmation_url = await create_recurring_charge(target_shop, SHOPIFY_ADMIN_ACCESS_TOKEN)
-        return HTMLResponse(content=f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <script type="text/javascript">
-                    window.top.location.href = "{confirmation_url}";
-                </script>
-            </head>
-            <body>
-                <p>Redirecting to $39/mo subscription approval...</p>
-            </body>
-            </html>
-        """)
-    except Exception as exc:
-        logger.error("REST Billing Error: %s", exc)
-        return HTMLResponse(content=f"""
-            <div style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: 0 auto;">
-                <h2>Billing Notice</h2>
-                <p>Could not generate charge: <strong>{exc}</strong></p>
-            </div>
-        """)
+    # 1. OAuth Code Present -> Exchange code for Partner Token & Create Subscription
+    if code and SHOPIFY_CLIENT_SECRET:
+        try:
+            partner_token = await exchange_code_for_token(target_shop, code)
+            confirmation_url = await create_recurring_charge(target_shop, partner_token)
+            return HTMLResponse(content=f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <script type="text/javascript">
+                        window.top.location.href = "{confirmation_url}";
+                    </script>
+                </head>
+                <body>
+                    <p>Redirecting to $39/mo subscription approval...</p>
+                </body>
+                </html>
+            """)
+        except Exception as exc:
+            logger.error("Partner OAuth Billing failed: %s", exc)
+            return HTMLResponse(content=f"""
+                <div style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: 0 auto;">
+                    <h2>Billing Notice</h2>
+                    <p>Could not generate subscription charge: <strong>{exc}</strong></p>
+                </div>
+            """)
+
+    # 2. Trigger OAuth Flow to get a Partner Token
+    redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
+    auth_url = (
+        f"https://{target_shop}/admin/oauth/authorize?"
+        f"client_id={SHOPIFY_CLIENT_ID}&"
+        f"scope=write_draft_orders,read_draft_orders&"
+        f"redirect_uri={redirect_uri}"
+    )
+    return HTMLResponse(content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <script type="text/javascript">
+                window.top.location.href = "{auth_url}";
+            </script>
+        </head>
+        <body>
+            <p>Connecting to Shopify Partner Billing...</p>
+        </body>
+        </html>
+    """)
