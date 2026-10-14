@@ -350,3 +350,26 @@ async def start_billing_flow(
         </body>
         </html>
     """)
+
+        # 2. Trigger OAuth flow explicitly requesting an expiring offline token
+    redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
+    auth_url = (
+        f"https://{target_shop}/admin/oauth/authorize?"
+        f"client_id={SHOPIFY_CLIENT_ID}&"
+        f"scope=write_draft_orders,read_draft_orders&"
+        f"redirect_uri={redirect_uri}&"
+        f"grant_options[]=value"
+    )
+    return HTMLResponse(content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <script type="text/javascript">
+                window.top.location.href = "{auth_url}";
+            </script>
+        </head>
+        <body>
+            <p>Redirecting to authorization...</p>
+        </body>
+        </html>
+    """)
