@@ -10,15 +10,12 @@ scopes = "write_draft_orders,read_draft_orders"
 
 [auth]
 redirect_urls = [
-  "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
+  "https://shopify-eu-vat-shield.onrender.com"
 ]
 
 [build]
 automatically_update_urls_on_dev = true
 
-# =====================================================================
-# 🟢 NATIVE SHOPIFY MANAGED BILLING ($39/mo + 7-DAY FREE TRIAL)
-# =====================================================================
 [billing]
 required = true
 
