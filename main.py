@@ -1,6 +1,6 @@
 """
 FastAPI Server for EU VAT Shield
-Production Engine: VAT Validation, 0% Tax Draft Checkout, and $39/mo 7-Day Free Trial Billing
+Handles VAT Validation, 0% Tax Draft Checkout, OAuth Partner Token Exchange, and $39/mo GraphQL Billing
 """
 
 import logging
@@ -21,7 +21,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Shopify Configuration
-SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "vat-shield-fresh-dev.myshopify.com").rstrip("/")
+SHOPIFY_SHOP_DOMAIN = os.environ.get("SHOPIFY_SHOP_DOMAIN", "vat-test-engine.myshopify.com").rstrip("/")
 SHOPIFY_ADMIN_ACCESS_TOKEN = os.environ.get("SHOPIFY_ADMIN_ACCESS_TOKEN", "")
 SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "e5d2cc0cbb67a7b24c63de9aca610ff4")
 SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
@@ -34,7 +34,7 @@ TRIAL_DAYS = 7     # 7 Days 100% Free Trial
 
 app = FastAPI(
     title="EU VAT Shield API",
-    description="Production API for validating European VAT numbers and generating 0% tax checkouts.",
+    description="API for validating European VAT numbers and generating 0% tax checkouts.",
     version="1.0.0",
 )
 
@@ -89,7 +89,7 @@ class ExemptCheckoutResponse(BaseModel):
     error_code: Optional[str] = None
 
 
-# --- Helper: Exchange OAuth Code for Access Token ---
+# --- Helper: Exchange OAuth Code for Partner App Access Token ---
 async def exchange_code_for_token(shop: str, code: str) -> str:
     url = f"https://{shop}/admin/oauth/access_token"
     payload = {
@@ -115,7 +115,7 @@ async def create_shopify_draft_order(
     customer_email: Optional[str] = None,
 ) -> dict:
     if not SHOPIFY_SHOP_DOMAIN or not SHOPIFY_ADMIN_ACCESS_TOKEN:
-        raise ValueError("Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN in environment variables.")
+        raise ValueError("Missing SHOPIFY_SHOP_DOMAIN or SHOPIFY_ADMIN_ACCESS_TOKEN")
 
     url = f"https://{SHOPIFY_SHOP_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/draft_orders.json"
     headers = {
@@ -132,7 +132,7 @@ async def create_shopify_draft_order(
     payload = {
         "draft_order": {
             "line_items": normalized_items,
-            "tax_exempt": True,  # 0% Tax applied securely
+            "tax_exempt": True,
             "note": f"EU B2B Tax-Exempt Order. Validated VAT: {vat_number} ({company_label})",
             "tags": "eu-vat-exempt, b2b",
             "note_attributes": [
@@ -149,7 +149,6 @@ async def create_shopify_draft_order(
         response = await client.post(url, headers=headers, json=payload)
 
     if response.status_code not in (200, 201):
-        logger.error("Shopify Admin API Error: %s", response.text)
         raise HTTPException(
             status_code=response.status_code,
             detail=f"Shopify API Error: {response.text}"
@@ -162,34 +161,55 @@ async def create_shopify_draft_order(
     }
 
 
-# --- Helper: Create 7-Day Free Trial Recurring Charge ---
-async def create_recurring_charge(shop_domain: str, token: str) -> str:
-    url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/recurring_application_charges.json"
+# --- Helper: Create 7-Day Free Trial Subscription via GraphQL ---
+async def create_7day_trial_subscription(shop_domain: str, token: str) -> str:
+    graphql_url = f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
     headers = {
         "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
     }
 
-    payload = {
-        "recurring_application_charge": {
-            "name": PLAN_NAME,
-            "price": PLAN_PRICE,
-            "return_url": f"https://{shop_domain}/admin/apps",
-            "trial_days": TRIAL_DAYS,
-            "test": True,  # Set to False when taking real money on Shopify App Store
-        }
+    mutation = """
+    mutation AppSubscriptionCreate($name: String!, $lineItems: [AppSubscriptionLineItemInput!]!, $returnUrl: URL!, $trialDays: Int!, $test: Boolean) {
+      appSubscriptionCreate(name: $name, lineItems: $lineItems, returnUrl: $returnUrl, trialDays: $trialDays, test: $test) {
+        userErrors { field message }
+        confirmationUrl
+      }
+    }
+    """
+
+    variables = {
+        "name": PLAN_NAME,
+        "returnUrl": f"https://{shop_domain}/admin/apps",
+        "trialDays": TRIAL_DAYS,
+        "test": True,  # Set to False when taking real money on Shopify App Store
+        "lineItems": [{
+            "plan": {
+                "appRecurringPricingDetails": {
+                    "price": {"amount": PLAN_PRICE, "currencyCode": "USD"},
+                    "interval": "EVERY_30_DAYS"
+                }
+            }
+        }]
     }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        res = await client.post(url, headers=headers, json=payload)
+        res = await client.post(graphql_url, headers=headers, json={"query": mutation, "variables": variables})
         data = res.json()
 
-    charge = data.get("recurring_application_charge", {})
-    confirmation_url = charge.get("confirmation_url")
+    # Log GraphQL Response for full debugging visibility
+    logger.info("GraphQL Billing Response: %s", data)
+
+    if "errors" in data and data["errors"]:
+        raise Exception(f"GraphQL API Errors: {data['errors']}")
+
+    data_obj = data.get("data") or {}
+    sub_create = data_obj.get("appSubscriptionCreate") or {}
+    confirmation_url = sub_create.get("confirmationUrl")
 
     if not confirmation_url:
-        logger.error("Charge Creation Failed: %s", data)
-        raise Exception(f"Charge Error: {data}")
+        user_errors = sub_create.get("userErrors", [])
+        raise Exception(f"Subscription userErrors: {user_errors} | Full Response: {data}")
 
     return confirmation_url
 
@@ -289,21 +309,26 @@ async def create_exempt_checkout(request: ExemptCheckoutRequest):
         )
 
 
-# 🟢 BILLING ENDPOINT
+# 🟢 BILLING ENDPOINT (WITH EXPIRING TOKEN OAUTH + IFRAME BREAKOUT)
 @app.get("/api/v1/billing/subscribe")
 async def start_billing_flow(
     shop: Optional[str] = None,
     code: Optional[str] = None,
 ):
+    """
+    Handles installation OAuth callback & subscription approval.
+    Includes grant_options[]=value to request expiring offline tokens required by Shopify GraphQL.
+    Breaks out of Shopify Admin iframe via window.top.location.href.
+    """
     target_shop = shop or SHOPIFY_SHOP_DOMAIN
     if not target_shop:
         return HTMLResponse("<div style='padding:40px;font-family:sans-serif;'><h3>Error: Missing shop parameter</h3></div>")
 
-    # 1. OAuth Code Present -> Exchange for token & create recurring charge
+    # 1. OAuth Code Present -> Exchange code for Expiring Partner Token & Create Subscription
     if code and SHOPIFY_CLIENT_SECRET:
         try:
-            token = await exchange_code_for_token(target_shop, code)
-            confirmation_url = await create_recurring_charge(target_shop, token)
+            partner_token = await exchange_code_for_token(target_shop, code)
+            confirmation_url = await create_7day_trial_subscription(target_shop, partner_token)
             return HTMLResponse(content=f"""
                 <!DOCTYPE html>
                 <html>
@@ -313,7 +338,7 @@ async def start_billing_flow(
                     </script>
                 </head>
                 <body>
-                    <p>Redirecting to subscription approval...</p>
+                    <p style="font-family:sans-serif;padding:20px;">Redirecting to $39/mo subscription approval...</p>
                 </body>
                 </html>
             """)
@@ -322,31 +347,11 @@ async def start_billing_flow(
             return HTMLResponse(content=f"""
                 <div style="font-family: sans-serif; padding: 40px; max-width: 600px; margin: 0 auto;">
                     <h2>Billing Notice</h2>
-                    <p>Status: <strong>{exc}</strong></p>
+                    <p>Subscription charge creation status: <strong>{exc}</strong></p>
                 </div>
             """)
 
-    # 2. Try directly with env token
-    if SHOPIFY_ADMIN_ACCESS_TOKEN and not code:
-        try:
-            confirmation_url = await create_recurring_charge(target_shop, SHOPIFY_ADMIN_ACCESS_TOKEN)
-            return HTMLResponse(content=f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <script type="text/javascript">
-                        window.top.location.href = "{confirmation_url}";
-                    </script>
-                </head>
-                <body>
-                    <p>Redirecting to subscription approval...</p>
-                </body>
-                </html>
-            """)
-        except Exception as exc:
-            logger.warning("Env token charge failed, triggering OAuth: %s", exc)
-
-    # 3. Fallback -> Trigger OAuth flow
+    # 2. Trigger OAuth flow WITH grant_options[]=value (Expiring Offline Access Token)
     redirect_uri = "https://shopify-eu-vat-shield.onrender.com/api/v1/billing/subscribe"
     auth_url = (
         f"https://{target_shop}/admin/oauth/authorize?"
@@ -364,7 +369,7 @@ async def start_billing_flow(
             </script>
         </head>
         <body>
-            <p>Connecting to Shopify Billing...</p>
+            <p style="font-family:sans-serif;padding:20px;">Connecting to Shopify Partner Billing...</p>
         </body>
         </html>
     """)
